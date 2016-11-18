@@ -113,7 +113,7 @@ static void DoChildren( playlist_export_t *p_export, playlist_item_t *p_root,
             free( psz_uri );
             psz_uri = psz_path;
         }
-        fprintf( p_export->p_file, "%s\n", psz_uri );
+        pf_fprintf( p_export->p_file, "%s\n", psz_uri );
         free( psz_uri );
     }
 }

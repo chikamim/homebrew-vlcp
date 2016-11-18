@@ -3,9 +3,9 @@
 
 basedir = codec
 dir = codec
-mods = a52 adpcm aes3 araw cc cdg cvdsub dirac dts dvbsub faad fake flac fluidsynth invmem kate libass libmpeg2 lpcm mash mpeg_audio png quicktime rawvideo realvideo schroedinger sdl_image speex svcdsub telx theora tremor twolame vorbis x264 zvbi
-libvlc_LTLIBRARIES =  $(LTLIBdirac) $(LTLIBfaad) $(LTLIBflac) $(LTLIBfluidsynth) $(LTLIBkate) $(LTLIBlibass) $(LTLIBlibmpeg2) $(LTLIBmash) $(LTLIBpng) $(LTLIBquicktime) $(LTLIBrealvideo) $(LTLIBschroedinger) $(LTLIBsdl_image) $(LTLIBspeex) $(LTLIBtelx) $(LTLIBtheora) $(LTLIBtremor) $(LTLIBtwolame) $(LTLIBvorbis) $(LTLIBx264) $(LTLIBzvbi)
-EXTRA_LTLIBRARIES =  libdirac_plugin.la libfaad_plugin.la libflac_plugin.la libfluidsynth_plugin.la libkate_plugin.la liblibass_plugin.la liblibmpeg2_plugin.la libmash_plugin.la libpng_plugin.la libquicktime_plugin.la librealvideo_plugin.la libschroedinger_plugin.la libsdl_image_plugin.la libspeex_plugin.la libtelx_plugin.la libtheora_plugin.la libtremor_plugin.la libtwolame_plugin.la libvorbis_plugin.la libx264_plugin.la libzvbi_plugin.la
+mods = a52 adpcm aes3 araw aribsub cc cdg cvdsub dirac dts dvbsub faad fake flac fluidsynth invmem kate libass libmpeg2 lpcm mash mpeg_audio png quicktime rawvideo realvideo schroedinger sdl_image speex svcdsub telx theora tremor twolame vorbis x264 zvbi
+libvlc_LTLIBRARIES =  $(LTLIBaribsub) $(LTLIBdirac) $(LTLIBfaad) $(LTLIBflac) $(LTLIBfluidsynth) $(LTLIBkate) $(LTLIBlibass) $(LTLIBlibmpeg2) $(LTLIBmash) $(LTLIBpng) $(LTLIBquicktime) $(LTLIBrealvideo) $(LTLIBschroedinger) $(LTLIBsdl_image) $(LTLIBspeex) $(LTLIBtelx) $(LTLIBtheora) $(LTLIBtremor) $(LTLIBtwolame) $(LTLIBvorbis) $(LTLIBx264) $(LTLIBzvbi)
+EXTRA_LTLIBRARIES =  libaribsub_plugin.la libdirac_plugin.la libfaad_plugin.la libflac_plugin.la libfluidsynth_plugin.la libkate_plugin.la liblibass_plugin.la liblibmpeg2_plugin.la libmash_plugin.la libpng_plugin.la libquicktime_plugin.la librealvideo_plugin.la libschroedinger_plugin.la libsdl_image_plugin.la libspeex_plugin.la libtelx_plugin.la libtheora_plugin.la libtremor_plugin.la libtwolame_plugin.la libvorbis_plugin.la libx264_plugin.la libzvbi_plugin.la
 
 include $(top_srcdir)/modules/common.am
 
@@ -52,6 +52,17 @@ libaraw_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS)
 # Set LIBADD and DEPENDENCIES manually:
 libaraw_plugin_la_LIBADD = $(AM_LIBADD)
 libaraw_plugin_la_DEPENDENCIES = $(top_srcdir)/src/libvlccore.sym
+
+# The aribsub plugin
+libaribsub_plugin_la_SOURCES = $(SOURCES_aribsub)
+nodist_libaribsub_plugin_la_SOURCES = $(nodist_SOURCES_aribsub)
+# Force per-target objects:
+libaribsub_plugin_la_CFLAGS = $(AM_CFLAGS)
+libaribsub_plugin_la_CXXFLAGS = $(AM_CXXFLAGS)
+libaribsub_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS)
+# Set LIBADD and DEPENDENCIES manually:
+libaribsub_plugin_la_LIBADD = $(AM_LIBADD)
+libaribsub_plugin_la_DEPENDENCIES = $(top_srcdir)/src/libvlccore.sym
 
 # The cc plugin
 libcc_plugin_la_SOURCES = $(SOURCES_cc)

@@ -52,7 +52,7 @@ static bool ContainsURL( demux_t *p_demux );
 
 static char *GuessEncoding (const char *str)
 {
-    return IsUTF8 (str) ? strdup (str) : FromLatin1 (str);
+    return IsUTF8 (str) ? strdup (str) : FromLocale (str);
 }
 
 /*****************************************************************************

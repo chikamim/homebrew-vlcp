@@ -92,6 +92,8 @@
 
 #undef TS_DEBUG
 
+#include "../codec/aribb24dec.h"
+
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
@@ -142,23 +144,21 @@ static void Close ( vlc_object_t * );
     "The decryption routines subtract the TS-header from the value before " \
     "decrypting. " )
 
-#define TSDUMP_TEXT N_("Filename of dump")
-#define TSDUMP_LONGTEXT N_("Specify a filename where to dump the TS in.")
-
-#define APPEND_TEXT N_("Append")
-#define APPEND_LONGTEXT N_( \
-    "If the file exists and this option is selected, the existing file " \
-    "will not be overwritten." )
-
-#define DUMPSIZE_TEXT N_("Dump buffer size")
-#define DUMPSIZE_LONGTEXT N_( \
-    "Tweak the buffer size for reading and writing an integer number of packets." \
-    "Specify the size of the buffer here and not the number of packets." )
-
 #define SPLIT_ES_TEXT N_("Separate sub-streams")
 #define SPLIT_ES_LONGTEXT N_( \
     "Separate teletex/dvbs pages into independent ES. " \
     "It can be useful to turn off this option when using stream output." )
+
+#define SEEK_PERCENT_TEXT N_("Seek based on percent not time")
+#define SEEK_PERCENT_LONGTEXT N_( \
+    "Seek and position based on a percent byte position, not a PCR generated " \
+    "time position. If seeking doesn't work propery, turn on this option." )
+
+#define SUPPORT_ARIB_TEXT N_("Support ARIB STD-B24.")
+#define SUPPORT_ARIB_LONGTEXT N_( \
+    "Support ARIB STD-B24 for decoding characters." \
+    "This feature affect EPG information and subtitle." )
+
 
 vlc_module_begin ()
     set_description( N_("MPEG Transport Stream demuxer") )
@@ -177,11 +177,9 @@ vlc_module_begin ()
     add_integer( "ts-csa-pkt", 188, NULL, CPKT_TEXT, CPKT_LONGTEXT, true )
     add_bool( "ts-silent", false, NULL, SILENT_TEXT, SILENT_LONGTEXT, true )
 
-    add_file( "ts-dump-file", NULL, NULL, TSDUMP_TEXT, TSDUMP_LONGTEXT, false )
-    add_bool( "ts-dump-append", false, NULL, APPEND_TEXT, APPEND_LONGTEXT, false )
-    add_integer( "ts-dump-size", 16384, NULL, DUMPSIZE_TEXT,
-                 DUMPSIZE_LONGTEXT, true )
     add_bool( "ts-split-es", true, NULL, SPLIT_ES_TEXT, SPLIT_ES_LONGTEXT, false )
+    add_bool( "ts-seek-percent", false, NULL, SEEK_PERCENT_TEXT, SEEK_PERCENT_LONGTEXT, true )
+    add_bool( "ts-support-arib", false, NULL, SUPPORT_ARIB_TEXT, SUPPORT_ARIB_LONGTEXT, true )
 
     set_capability( "demux", 10 )
     set_callbacks( Open, Close )
@@ -288,6 +286,7 @@ typedef struct
     int             i_number;
     int             i_pid_pcr;
     int             i_pid_pmt;
+    mtime_t         i_pcr_value;
     /* IOD stuff (mpeg4) */
     iod_descriptor_t *iod;
 
@@ -353,6 +352,18 @@ struct demux_sys_t
     /* how many TS packet we read at once */
     int         i_ts_read;
 
+    /* to determine length and time */
+    int         i_pid_ref_pcr;
+    mtime_t     i_first_pcr;
+    mtime_t     i_current_pcr;
+    mtime_t     i_last_pcr;
+    bool        b_force_seek_per_percent;
+    int         i_pcrs_num;
+    mtime_t     *p_pcrs;
+    int64_t     *p_pos;
+
+    bool        b_support_arib;
+
     /* All pid */
     ts_pid_t    pid[8192];
 
@@ -387,18 +398,11 @@ struct demux_sys_t
     int         i_current_program;
     vlc_list_t  programs_list;
 
-    /* TS dump */
-    char        *psz_file;  /* file to dump data in */
-    FILE        *p_file;    /* filehandle */
-    uint64_t    i_write;    /* bytes written */
-    bool        b_file_out; /* dump mode enabled */
-
     /* */
     bool        b_start_record;
 };
 
 static int Demux    ( demux_t *p_demux );
-static int DemuxFile( demux_t *p_demux );
 static int Control( demux_t *p_demux, int i_query, va_list args );
 
 static void PIDInit ( ts_pid_t *pid, bool b_psi, ts_psi_t *p_owner );
@@ -420,6 +424,13 @@ static inline int PIDGet( block_t *p )
 
 static bool GatherPES( demux_t *p_demux, ts_pid_t *pid, block_t *p_bk );
 
+static block_t* ReadTSPacket( demux_t *p_demux );
+static mtime_t GetPCR( block_t *p_pkt );
+static int SeekToPCR( demux_t *p_demux, int64_t i_pos );
+static int Seek( demux_t *p_demux, double f_percent );
+static void GetFirstPCR( demux_t *p_demux );
+static void GetLastPCR( demux_t *p_demux );
+static void CheckPCR( demux_t *p_demux );
 static void PCRHandle( demux_t *p_demux, ts_pid_t *, block_t * );
 
 static iod_descriptor_t *IODNew( int , uint8_t * );
@@ -450,8 +461,6 @@ static int Open( vlc_object_t *p_this )
     int          i_packet_size;
 
     ts_pid_t    *pat;
-    const char  *psz_mode;
-    bool         b_append;
     bool         b_topfield = false;
 
     if( stream_Peek( p_demux->s, &p_peek, TS_PACKET_SIZE_MAX ) <
@@ -593,54 +602,9 @@ static int Open( vlc_object_t *p_this )
     p_sys->i_packet_size = i_packet_size;
     vlc_mutex_init( &p_sys->csa_lock );
 
-    /* Fill dump mode fields */
-    p_sys->i_write = 0;
     p_sys->buffer = NULL;
-    p_sys->p_file = NULL;
-    p_sys->b_file_out = false;
-    p_sys->psz_file = var_CreateGetString( p_demux, "ts-dump-file" );
-    if( *p_sys->psz_file != '\0' )
-    {
-        p_sys->b_file_out = true;
 
-        b_append = var_CreateGetBool( p_demux, "ts-dump-append" );
-        if ( b_append )
-            psz_mode = "ab";
-        else
-            psz_mode = "wb";
-
-        if( !strcmp( p_sys->psz_file, "-" ) )
-        {
-            msg_Info( p_demux, "dumping raw stream to standard output" );
-            p_sys->p_file = stdout;
-        }
-        else if( ( p_sys->p_file = vlc_fopen( p_sys->psz_file, psz_mode ) ) == NULL )
-        {
-            msg_Err( p_demux, "cannot create `%s' for writing", p_sys->psz_file );
-            p_sys->b_file_out = false;
-        }
-
-        if( p_sys->b_file_out )
-        {
-            /* Determine how many packets to read. */
-            int bufsize = var_CreateGetInteger( p_demux, "ts-dump-size" );
-            p_sys->i_ts_read = (int) (bufsize / p_sys->i_packet_size);
-            if( p_sys->i_ts_read <= 0 )
-            {
-                p_sys->i_ts_read = 1500 / p_sys->i_packet_size;
-            }
-            p_sys->buffer = xmalloc( p_sys->i_packet_size * p_sys->i_ts_read );
-            msg_Info( p_demux, "%s raw stream to file `%s' reading packets %d",
-                      b_append ? "appending" : "dumping", p_sys->psz_file,
-                      p_sys->i_ts_read );
-        }
-    }
-
-    /* Fill p_demux field */
-    if( p_sys->b_file_out )
-        p_demux->pf_demux = DemuxFile;
-    else
-        p_demux->pf_demux = Demux;
+    p_demux->pf_demux = Demux;
     p_demux->pf_control = Control;
 
     /* Init p_sys field */
@@ -718,7 +682,7 @@ static int Open( vlc_object_t *p_this )
     p_sys->b_es_id_pid = var_CreateGetBool( p_demux, "ts-es-id-pid" );
 
     char* psz_string = var_CreateGetString( p_demux, "ts-out" );
-    if( psz_string && *psz_string && !p_sys->b_file_out )
+    if( psz_string && *psz_string )
     {
         char *psz = strchr( psz_string, ':' );
         int   i_port = 0;
@@ -808,14 +772,35 @@ static int Open( vlc_object_t *p_this )
 
     p_sys->b_silent = var_CreateGetBool( p_demux, "ts-silent" );
     p_sys->b_split_es = var_InheritBool( p_demux, "ts-split-es" );
+    p_sys->b_support_arib = var_InheritBool( p_demux, "ts-support-arib" );
 
-    while( !p_sys->b_file_out && p_sys->i_pmt_es <= 0 &&
-           vlc_object_alive( p_demux ) )
+    p_sys->i_pid_ref_pcr = -1;
+    p_sys->i_first_pcr = -1;
+    p_sys->i_current_pcr = -1;
+    p_sys->i_last_pcr = -1;
+    p_sys->b_force_seek_per_percent = var_InheritBool( p_demux, "ts-seek-percent" );
+    p_sys->i_pcrs_num = 10;
+    p_sys->p_pcrs = (mtime_t *)calloc( p_sys->i_pcrs_num, sizeof( mtime_t ) );
+    p_sys->p_pos = (int64_t *)calloc( p_sys->i_pcrs_num, sizeof( int64_t ) );
+
+    bool can_seek = false;
+    stream_Control( p_demux->s, STREAM_CAN_SEEK, &can_seek );
+    if( can_seek  )
+    {
+        GetFirstPCR( p_demux );
+        CheckPCR( p_demux );
+        GetLastPCR( p_demux );
+    }
+    if( p_sys->i_first_pcr < 0 || p_sys->i_last_pcr < 0 )
+    {
+        p_sys->b_force_seek_per_percent = true;
+    }
+
+    while( p_sys->i_pmt_es <= 0  && vlc_object_alive( p_demux ) )
     {
         if( p_demux->pf_demux( p_demux ) != 1 )
             break;
     }
-
 
     return VLC_SUCCESS;
 }
@@ -886,17 +871,6 @@ static void Close( vlc_object_t *p_this )
 
     free( p_sys->programs_list.p_values );
 
-    /* If in dump mode, then close the file */
-    if( p_sys->b_file_out )
-    {
-        msg_Info( p_demux ,"closing %s (%"PRId64" KiB dumped)",
-                  p_sys->psz_file, p_sys->i_write / 1024 );
-
-        if( p_sys->p_file != stdout )
-        {
-            fclose( p_sys->p_file );
-        }
-    }
     /* When streaming, close the port */
     if( p_sys->fd > -1 )
     {
@@ -904,7 +878,9 @@ static void Close( vlc_object_t *p_this )
     }
 
     free( p_sys->buffer );
-    free( p_sys->psz_file );
+
+    free( p_sys->p_pcrs );
+    free( p_sys->p_pos );
 
     vlc_mutex_destroy( &p_sys->csa_lock );
     free( p_sys );
@@ -933,108 +909,6 @@ static int ChangeKeyCallback( vlc_object_t *p_this, char const *psz_cmd,
 }
 
 /*****************************************************************************
- * DemuxFile:
- *****************************************************************************/
-static int DemuxFile( demux_t *p_demux )
-{
-    demux_sys_t *p_sys = p_demux->p_sys;
-    const int i_bufsize = p_sys->i_packet_size * p_sys->i_ts_read;
-    uint8_t   *p_buffer = p_sys->buffer; /* Put first on sync byte */
-    const int i_data = stream_Read( p_demux->s, p_sys->buffer, i_bufsize );
-
-    if( i_data <= 0 && i_data < p_sys->i_packet_size )
-    {
-        msg_Dbg( p_demux, "error reading malformed packets" );
-        return i_data;
-    }
-
-    /* Test continuity counter */
-    for( int i_pos = 0; i_pos < i_data;  )
-    {
-        if( p_sys->buffer[i_pos] != 0x47 )
-        {
-            msg_Warn( p_demux, "lost sync" );
-            while( vlc_object_alive (p_demux) && (i_pos < i_data) )
-            {
-                i_pos++;
-                if( p_sys->buffer[i_pos] == 0x47 )
-                    break;
-            }
-            if( vlc_object_alive (p_demux) )
-                msg_Warn( p_demux, "sync found" );
-        }
-
-        /* continuous when (one of this):
-         * diff == 1
-         * diff == 0 and payload == 0
-         * diff == 0 and duplicate packet (playload != 0) <- should we
-         *   test the content ?
-         */
-        const int i_cc  = p_buffer[i_pos+3]&0x0f;
-        const bool b_payload = p_buffer[i_pos+3]&0x10;
-        const bool b_adaptation = p_buffer[i_pos+3]&0x20;
-
-        /* Get the PID */
-        ts_pid_t *p_pid = &p_sys->pid[ ((p_buffer[i_pos+1]&0x1f)<<8)|p_buffer[i_pos+2] ];
-
-        /* Detect discontinuity indicator in adaptation field */
-        if( b_adaptation && p_buffer[i_pos + 4] > 0 )
-        {
-            if( p_buffer[i_pos+5]&0x80 )
-                msg_Warn( p_demux, "discontinuity indicator (pid=%d) ", p_pid->i_pid );
-            if( p_buffer[i_pos+5]&0x40 )
-                msg_Warn( p_demux, "random access indicator (pid=%d) ", p_pid->i_pid );
-        }
-
-        const int i_diff = ( i_cc - p_pid->i_cc )&0x0f;
-        if( b_payload && i_diff == 1 )
-        {
-            p_pid->i_cc = ( p_pid->i_cc + 1 ) & 0xf;
-        }
-        else
-        {
-            if( p_pid->i_cc == 0xff )
-            {
-                msg_Warn( p_demux, "first packet for pid=%d cc=0x%x",
-                        p_pid->i_pid, i_cc );
-                p_pid->i_cc = i_cc;
-            }
-            else if( i_diff != 0 )
-            {
-                /* FIXME what to do when discontinuity_indicator is set ? */
-                msg_Warn( p_demux, "transport error detected 0x%x instead of 0x%x",
-                          i_cc, ( p_pid->i_cc + 1 )&0x0f );
-
-                p_pid->i_cc = i_cc;
-                /* Mark transport error in the TS packet. */
-                p_buffer[i_pos+1] |= 0x80;
-            }
-        }
-
-        /* Test if user wants to decrypt it first */
-        if( p_sys->csa )
-        {
-            vlc_mutex_lock( &p_sys->csa_lock );
-            csa_Decrypt( p_demux->p_sys->csa, &p_buffer[i_pos], p_demux->p_sys->i_csa_pkt_size );
-            vlc_mutex_unlock( &p_sys->csa_lock );
-        }
-
-        i_pos += p_sys->i_packet_size;
-    }
-
-    /* Then write */
-    const int i_write = fwrite( p_sys->buffer, 1, i_data, p_sys->p_file );
-    if( i_write < 0 )
-    {
-        msg_Err( p_demux, "failed to write data" );
-        return -1;
-    }
-
-    p_sys->i_write += i_write;
-    return 1;
-}
-
-/*****************************************************************************
  * Demux:
  *****************************************************************************/
 static int Demux( demux_t *p_demux )
@@ -1047,57 +921,9 @@ static int Demux( demux_t *p_demux )
     {
         bool         b_frame = false;
         block_t     *p_pkt;
-
-        /* Get a new TS packet */
-        if( !( p_pkt = stream_Block( p_demux->s, p_sys->i_packet_size ) ) )
+        if( !(p_pkt = ReadTSPacket( p_demux )) )
         {
-            msg_Dbg( p_demux, "eof ?" );
             return 0;
-        }
-
-        /* Check sync byte and re-sync if needed */
-        if( p_pkt->p_buffer[0] != 0x47 )
-        {
-            msg_Warn( p_demux, "lost synchro" );
-            block_Release( p_pkt );
-
-            while( vlc_object_alive (p_demux) )
-            {
-                const uint8_t *p_peek;
-                int i_peek, i_skip = 0;
-
-                i_peek = stream_Peek( p_demux->s, &p_peek,
-                                      p_sys->i_packet_size * 10 );
-                if( i_peek < p_sys->i_packet_size + 1 )
-                {
-                    msg_Dbg( p_demux, "eof ?" );
-                    return 0;
-                }
-
-                while( i_skip < i_peek - p_sys->i_packet_size )
-                {
-                    if( p_peek[i_skip] == 0x47 &&
-                        p_peek[i_skip + p_sys->i_packet_size] == 0x47 )
-                    {
-                        break;
-                    }
-                    i_skip++;
-                }
-
-                msg_Dbg( p_demux, "skipping %d bytes of garbage", i_skip );
-                stream_Read( p_demux->s, NULL, i_skip );
-
-                if( i_skip < i_peek - p_sys->i_packet_size )
-                {
-                    break;
-                }
-            }
-
-            if( !( p_pkt = stream_Block( p_demux->s, p_sys->i_packet_size ) ) )
-            {
-                msg_Dbg( p_demux, "eof ?" );
-                return 0;
-            }
         }
 
         if( p_sys->b_start_record )
@@ -1210,71 +1036,87 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
     int64_t *pi64;
     int i_int;
 
-    if( p_sys->b_file_out )
-        return demux_vaControlHelper( p_demux->s, 0, -1, 0, 1, i_query, args );
-
     switch( i_query )
     {
     case DEMUX_GET_POSITION:
         pf = (double*) va_arg( args, double* );
-        i64 = stream_Size( p_demux->s );
-        if( i64 > 0 )
-        {
-            double f_current = stream_Tell( p_demux->s );
-            *pf = f_current / (double)i64;
-        }
-        else
+
+        if( p_sys->b_force_seek_per_percent ||
+            (p_sys->b_dvb_meta && p_sys->b_access_control) ||
+            p_sys->i_first_pcr < 0 ||
+            p_sys->i_current_pcr - p_sys->i_first_pcr < 0 ||
+            p_sys->i_last_pcr - p_sys->i_first_pcr <= 0 )
         {
             int64_t i_time, i_length;
             if( !DVBEventInformation( p_demux, &i_time, &i_length ) && i_length > 0 )
                 *pf = (double)i_time/(double)i_length;
+            else if( (i64 = stream_Size( p_demux->s) ) > 0 )
+                *pf = (double)stream_Tell( p_demux->s ) / (double)i64;
             else
                 *pf = 0.0;
         }
+        else
+        {
+            *pf = (double)(p_sys->i_current_pcr - p_sys->i_first_pcr) / (double)(p_sys->i_last_pcr - p_sys->i_first_pcr);
+        }
         return VLC_SUCCESS;
+
     case DEMUX_SET_POSITION:
         f = (double) va_arg( args, double );
-        i64 = stream_Size( p_demux->s );
 
-        if( stream_Seek( p_demux->s, (int64_t)(i64 * f) ) )
-            return VLC_EGENERIC;
-
+        if( p_sys->b_force_seek_per_percent ||
+            (p_sys->b_dvb_meta && p_sys->b_access_control) ||
+            p_sys->i_first_pcr < 0 ||
+            p_sys->i_last_pcr - p_sys->i_first_pcr <= 0 )
+        {
+            i64 = stream_Size( p_demux->s );
+            if( stream_Seek( p_demux->s, (int64_t)(i64 * f) ) )
+                return VLC_EGENERIC;
+        }
+        else
+        {
+            if( Seek( p_demux, f ) )
+            {
+                p_sys->b_force_seek_per_percent = true;
+                return VLC_EGENERIC;
+            }
+        }
         return VLC_SUCCESS;
-#if 0
 
     case DEMUX_GET_TIME:
         pi64 = (int64_t*)va_arg( args, int64_t * );
-        if( p_sys->i_time < 0 )
+        if( (p_sys->b_dvb_meta && p_sys->b_access_control) ||
+            p_sys->i_first_pcr < 0 ||
+            p_sys->i_current_pcr - p_sys->i_first_pcr < 0 )
         {
-            *pi64 = 0;
-            return VLC_EGENERIC;
+            if( DVBEventInformation( p_demux, pi64, NULL ) )
+            {
+                *pi64 = 0;
+            }
         }
-        *pi64 = p_sys->i_time;
+        else
+        {
+            *pi64 = (p_sys->i_current_pcr - p_sys->i_first_pcr) * 100 / 9;
+        }
         return VLC_SUCCESS;
 
     case DEMUX_GET_LENGTH:
         pi64 = (int64_t*)va_arg( args, int64_t * );
-        if( p_sys->i_mux_rate > 0 )
+        if( (p_sys->b_dvb_meta && p_sys->b_access_control) ||
+            p_sys->i_first_pcr < 0 ||
+            p_sys->i_last_pcr - p_sys->i_first_pcr <= 0 )
         {
-            *pi64 = INT64_C(1000000) * ( stream_Size( p_demux->s ) / 50 ) /
-                    p_sys->i_mux_rate;
-            return VLC_SUCCESS;
+            if( DVBEventInformation( p_demux, NULL, pi64 ) )
+            {
+                *pi64 = 0;
+            }
         }
-        *pi64 = 0;
-        return VLC_EGENERIC;
-#else
-    case DEMUX_GET_TIME:
-        pi64 = (int64_t*)va_arg( args, int64_t * );
-        if( DVBEventInformation( p_demux, pi64, NULL ) )
-            *pi64 = 0;
+        else
+        {
+            *pi64 = (p_sys->i_last_pcr - p_sys->i_first_pcr) * 100 / 9;
+        }
         return VLC_SUCCESS;
 
-    case DEMUX_GET_LENGTH:
-        pi64 = (int64_t*)va_arg( args, int64_t * );
-        if( DVBEventInformation( p_demux, NULL, pi64 ) )
-            *pi64 = 0;
-        return VLC_SUCCESS;
-#endif
     case DEMUX_SET_GROUP:
     {
         vlc_list_t *p_list;
@@ -1385,6 +1227,7 @@ static int UserPmt( demux_t *p_demux, const char *psz_fmt )
 
     memset( prg, 0, sizeof( ts_prg_psi_t ) );
     prg->i_pid_pcr  = -1;
+    prg->i_pid_pmt  = -1;
     prg->i_pid_pmt  = -1;
     prg->i_version  = -1;
     prg->i_number   = i_number != 0 ? i_number : TS_USER_PMT_NUMBER;
@@ -1656,6 +1499,7 @@ static void PIDClean( demux_t *p_demux, ts_pid_t *pid )
     pid->b_valid = false;
 }
 
+
 /****************************************************************************
  * gathering stuff
  ****************************************************************************/
@@ -1803,10 +1647,7 @@ static void ParsePES( demux_t *p_demux, ts_pid_t *pid )
         /* */
         i_skip += 2;
     }
-#ifdef ZVBI_COMPILED
-    else if( pid->es->fmt.i_codec == VLC_CODEC_TELETEXT )
-        i_skip = 0; /*hack for zvbi support */
-#endif
+
     /* skip header */
     while( p_pes && i_skip > 0 )
     {
@@ -1856,7 +1697,39 @@ static void ParsePES( demux_t *p_demux, ts_pid_t *pid )
                 abort();
             p_block->p_buffer[p_block->i_buffer -1] = '\0';
         }
-
+        else if( pid->es->fmt.i_codec == VLC_CODEC_TELETEXT )
+        {
+            if( p_block->i_pts <= VLC_TS_INVALID )
+            {
+                /* Teletext may have missing PTS (ETSI EN 300 472 Annexe A)
+                 * In this case use the last PCR + 40ms */
+                for( int i = 0; pid->p_owner && i < pid->p_owner->i_prg; i++ )
+                {
+                    if( pid->i_owner_number == pid->p_owner->prg[i]->i_number )
+                    {
+                        mtime_t i_pcr = pid->p_owner->prg[i]->i_pcr_value;
+                        if( i_pcr > VLC_TS_INVALID )
+                            p_block->i_pts = VLC_TS_0 + i_pcr * 100 / 9 + 40000;
+                        break;
+                    }
+                }
+            }
+        }
+        else if( pid->es->fmt.i_codec == VLC_CODEC_ARIB )
+        {
+            if( p_block->i_pts <= VLC_TS_INVALID )
+            {
+                if( i_pes_size > 0 && p_block->i_buffer > i_pes_size )
+                {
+                    p_block->i_buffer = i_pes_size;
+                }
+                /* Append a \0 */
+                p_block = block_Realloc( p_block, 0, p_block->i_buffer + 1 );
+                if( !p_block )
+                    abort();
+                p_block->p_buffer[p_block->i_buffer -1] = '\0';
+            }
+        }
         for( i = 0; i < pid->i_extra_es; i++ )
         {
             es_out_Send( p_demux->out, pid->extra_es[i]->id,
@@ -1871,24 +1744,338 @@ static void ParsePES( demux_t *p_demux, ts_pid_t *pid )
     }
 }
 
-static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, block_t *p_bk )
+static block_t* ReadTSPacket( demux_t *p_demux )
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    block_t     *p_pkt;
+
+    /* Get a new TS packet */
+    if( !( p_pkt = stream_Block( p_demux->s, p_sys->i_packet_size ) ) )
+    {
+        msg_Dbg( p_demux, "eof ?" );
+        return NULL;
+    }
+
+    /* Check sync byte and re-sync if needed */
+    if( p_pkt->p_buffer[0] != 0x47 )
+    {
+        msg_Warn( p_demux, "lost synchro" );
+        block_Release( p_pkt );
+        while( vlc_object_alive (p_demux) )
+        {
+            const uint8_t *p_peek;
+            int i_peek, i_skip = 0;
+
+            i_peek = stream_Peek( p_demux->s, &p_peek,
+                    p_sys->i_packet_size * 10 );
+            if( i_peek < p_sys->i_packet_size + 1 )
+            {
+                msg_Dbg( p_demux, "eof ?" );
+                return NULL;
+            }
+
+            while( i_skip < i_peek - p_sys->i_packet_size )
+            {
+                if( p_peek[i_skip] == 0x47 &&
+                        p_peek[i_skip + p_sys->i_packet_size] == 0x47 )
+                {
+                    break;
+                }
+                i_skip++;
+            }
+            msg_Dbg( p_demux, "skipping %d bytes of garbage", i_skip );
+            stream_Read( p_demux->s, NULL, i_skip );
+
+            if( i_skip < i_peek - p_sys->i_packet_size )
+            {
+                break;
+            }
+        }
+        if( !( p_pkt = stream_Block( p_demux->s, p_sys->i_packet_size ) ) )
+        {
+            msg_Dbg( p_demux, "eof ?" );
+            return NULL;
+        }
+    }
+    return p_pkt;
+}
+
+static mtime_t AdjustPCRWrapAround( demux_t *p_demux, mtime_t i_pcr )
 {
     demux_sys_t   *p_sys = p_demux->p_sys;
-    const uint8_t *p = p_bk->p_buffer;
+    /*
+     * PCR is 33bit. If PCR reaches to 0x1FFFFFFFF (26:30:43.717), ressets from 0.
+     * So, need to add 0x1FFFFFFFF, for calculating duration or current position.
+     */
+    mtime_t i_adjust = 0;
+    int64_t i_pos = stream_Tell( p_demux->s );
+    int i;
+    for( i = 1; i < p_sys->i_pcrs_num && p_sys->p_pos[i] <= i_pos; ++i )
+    {
+        if( p_sys->p_pcrs[i-1] > p_sys->p_pcrs[i] )
+            i_adjust += 0x1FFFFFFFF;
+    }
+    if( p_sys->p_pcrs[i-1] > i_pcr )
+        i_adjust += 0x1FFFFFFFF;
 
-    if( p_sys->i_pmt_es <= 0 )
-        return;
+    return i_pcr + i_adjust;
+}
+
+static mtime_t GetPCR( block_t *p_pkt )
+{
+    const uint8_t *p = p_pkt->p_buffer;
+
+    mtime_t i_pcr = -1;
 
     if( ( p[3]&0x20 ) && /* adaptation */
         ( p[5]&0x10 ) &&
         ( p[4] >= 7 ) )
     {
         /* PCR is 33 bits */
-        const mtime_t i_pcr = ( (mtime_t)p[6] << 25 ) |
-                              ( (mtime_t)p[7] << 17 ) |
-                              ( (mtime_t)p[8] << 9 ) |
-                              ( (mtime_t)p[9] << 1 ) |
-                              ( (mtime_t)p[10] >> 7 );
+        i_pcr = ( (mtime_t)p[6] << 25 ) |
+                ( (mtime_t)p[7] << 17 ) |
+                ( (mtime_t)p[8] << 9 ) |
+                ( (mtime_t)p[9] << 1 ) |
+                ( (mtime_t)p[10] >> 7 );
+    }
+    return i_pcr;
+}
+
+static int SeekToPCR( demux_t *p_demux, int64_t i_pos )
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    mtime_t i_pcr = -1;
+    int64_t i_initial_pos = stream_Tell( p_demux->s );
+
+    if( i_pos < 0 )
+        return VLC_EGENERIC;
+
+    int64_t i_last_pos = i_pos + p_sys->i_packet_size * 4500; //XXX
+    if( i_last_pos > stream_Size( p_demux->s ) - p_sys->i_packet_size )
+    {
+        i_last_pos = stream_Size( p_demux->s ) - p_sys->i_packet_size;
+    }
+
+    if( stream_Seek( p_demux->s, i_pos ) )
+        return VLC_EGENERIC;
+
+    while( vlc_object_alive( p_demux ) )
+    {
+        block_t     *p_pkt;
+        if( !( p_pkt = ReadTSPacket( p_demux ) ) )
+        {
+            break;
+        }
+        if( PIDGet( p_pkt ) == p_sys->i_pid_ref_pcr )
+        {
+            i_pcr = GetPCR( p_pkt );
+        }
+        block_Release( p_pkt );
+        if( i_pcr >= 0 )
+            break;
+        if( stream_Tell( p_demux->s ) >= i_last_pos )
+            break;
+    }
+    if( i_pcr < 0 )
+    {
+        stream_Seek( p_demux->s, i_initial_pos );
+        return VLC_EGENERIC;
+    }
+    else
+    {
+        p_sys->i_current_pcr = i_pcr;
+        return VLC_SUCCESS;
+    }
+}
+
+static int Seek( demux_t *p_demux, double f_percent )
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    int64_t i_initial_pos = stream_Tell( p_demux->s );
+    mtime_t i_initial_pcr = p_sys->i_current_pcr;
+
+    /*
+     * Find the time position by using binary search algorithm.
+     */
+    mtime_t i_target_pcr = (p_sys->i_last_pcr - p_sys->i_first_pcr) * f_percent + p_sys->i_first_pcr;
+
+    int64_t i_head_pos = 0;
+    int64_t i_tail_pos = stream_Size( p_demux->s );
+    {
+        mtime_t i_adjust = 0;
+        int i;
+        for( i = 1; i < p_sys->i_pcrs_num; ++i )
+        {
+            if( p_sys->p_pcrs[i-1] > p_sys->p_pcrs[i] )
+                i_adjust += 0x1FFFFFFFF;
+            if( p_sys->p_pcrs[i] + i_adjust > i_target_pcr )
+                break;
+        }
+        i_head_pos = p_sys->p_pos[i-1];
+        i_tail_pos = ( i < p_sys->i_pcrs_num ) ?  p_sys->p_pos[i] : stream_Size( p_demux->s );
+    }
+    msg_Dbg( p_demux, "Seek():i_head_pos:%lld, i_tail_pos:%lld", i_head_pos, i_tail_pos);
+
+    bool b_found = false;
+    int i_cnt = 0;
+    while( i_head_pos <= i_tail_pos )
+    {
+        int64_t i_pos = i_head_pos + (i_tail_pos - i_head_pos) / 2;
+        if( SeekToPCR( p_demux, i_pos ) )
+            break;
+        p_sys->i_current_pcr = AdjustPCRWrapAround( p_demux, p_sys->i_current_pcr );
+        int64_t i_diff_msec = (p_sys->i_current_pcr - i_target_pcr) * 100 / 9 / 1000;
+        if( i_diff_msec > 500 )
+        {
+            i_tail_pos = i_pos - p_sys->i_packet_size;
+        }
+        else if( i_diff_msec < -500 )
+        {
+            i_head_pos = i_pos + p_sys->i_packet_size;
+        }
+        else
+        {
+            // diff time <= 500msec
+            b_found = true;
+            break;
+        }
+        ++i_cnt;
+    }
+    if( !b_found )
+    {
+        msg_Dbg( p_demux, "Seek():cannot find a time position. i_cnt:%d", i_cnt );
+        stream_Seek( p_demux->s, i_initial_pos );
+        p_sys->i_current_pcr = i_initial_pcr;
+        return VLC_EGENERIC;
+    }
+    else
+    {
+        msg_Dbg( p_demux, "Seek():can find a time position. i_cnt:%d", i_cnt );
+        return VLC_SUCCESS;
+    }
+}
+
+static void GetFirstPCR( demux_t *p_demux )
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    int64_t i_initial_pos = stream_Tell( p_demux->s );
+
+    if( stream_Seek( p_demux->s, 0 ) )
+        return;
+
+    while( vlc_object_alive (p_demux) )
+    {
+        block_t     *p_pkt;
+        if( !( p_pkt = ReadTSPacket( p_demux ) ) )
+        {
+            break;
+        }
+        mtime_t i_pcr = GetPCR( p_pkt );
+        if( i_pcr >= 0 )
+        {
+            p_sys->i_pid_ref_pcr = PIDGet( p_pkt );
+            p_sys->i_first_pcr = i_pcr;
+            p_sys->i_current_pcr = i_pcr;
+        }
+        block_Release( p_pkt );
+        if( p_sys->i_first_pcr >= 0 )
+            break;
+    }
+    stream_Seek( p_demux->s, i_initial_pos );
+}
+
+static void GetLastPCR( demux_t *p_demux )
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    int64_t i_initial_pos = stream_Tell( p_demux->s );
+    mtime_t i_initial_pcr = p_sys->i_current_pcr;
+
+    int64_t i_last_pos = stream_Size( p_demux->s ) - p_sys->i_packet_size;
+    int64_t i_pos = i_last_pos - p_sys->i_packet_size * 4500; /* FIXME if the value is not reasonable, please change it. */
+    if( i_pos < 0 )
+        return;
+
+    while( vlc_object_alive( p_demux ) )
+    {
+        if( SeekToPCR( p_demux, i_pos ) )
+            break;
+        p_sys->i_last_pcr = AdjustPCRWrapAround( p_demux, p_sys->i_current_pcr );
+        if( ( i_pos = stream_Tell( p_demux->s ) ) >= i_last_pos )
+            break;
+    }
+    if( p_sys->i_last_pcr >= 0 )
+    {
+        int64_t i_size = stream_Size( p_demux->s );
+        mtime_t i_duration_msec = ( p_sys->i_last_pcr - p_sys->i_first_pcr ) * 100 / 9 / 1000;
+        int64_t i_rate = ( i_size < 0 || i_duration_msec <= 0 ) ? 0 : i_size * 1000 * 8 / i_duration_msec;
+        const int64_t TS_SUPPOSED_MAXRATE = 55 * 1000 * 1000; //FIXME I think it's enough.
+        const int64_t TS_SUPPOSED_MINRATE = 0.5 * 1000 * 1000; //FIXME
+        if( i_rate < TS_SUPPOSED_MINRATE || i_rate > TS_SUPPOSED_MAXRATE )
+        {
+            msg_Dbg( p_demux, "calculated bitrate (%lldbit/s) is too low or too high. min bitrate (%lldbit/s) max bitrate (%lldbit/s)",
+                     i_rate, TS_SUPPOSED_MINRATE, TS_SUPPOSED_MAXRATE );
+            p_sys->i_last_pcr = -1;
+        }
+    }
+    stream_Seek( p_demux->s, i_initial_pos );
+    p_sys->i_current_pcr = i_initial_pcr;
+}
+
+static void CheckPCR( demux_t *p_demux )
+{
+    demux_sys_t   *p_sys = p_demux->p_sys;
+
+    int64_t i_initial_pos = stream_Tell( p_demux->s );
+    mtime_t i_initial_pcr = p_sys->i_current_pcr;
+
+    int64_t i_size = stream_Size( p_demux->s );
+
+    int i = 0;
+    p_sys->p_pcrs[0] = p_sys->i_first_pcr;
+    p_sys->p_pos[0] = i_initial_pos;
+
+    for( i = 1; i < p_sys->i_pcrs_num && vlc_object_alive( p_demux ); ++i )
+    {
+        int64_t i_pos = i_size / p_sys->i_pcrs_num * i;
+        if( SeekToPCR( p_demux, i_pos ) )
+            break;
+        p_sys->p_pcrs[i] = p_sys->i_current_pcr;
+        p_sys->p_pos[i] = stream_Tell( p_demux->s );
+        if( p_sys->p_pcrs[i-1] > p_sys->p_pcrs[i] )
+        {
+            msg_Dbg( p_demux, "PCR Wrap Around found between %d%% and %d%% (pcr:%lld(0x%09llx) pcr:%lld(0x%09llx))",
+                    (int)((i-1)*100/p_sys->i_pcrs_num), (int)(i*100/p_sys->i_pcrs_num), p_sys->p_pcrs[i-1], p_sys->p_pcrs[i-1], p_sys->p_pcrs[i], p_sys->p_pcrs[i] );
+        }
+    }
+    if( i < p_sys->i_pcrs_num )
+    {
+        msg_Dbg( p_demux, "Force Seek Per Percent: Seeking failed at %d%%.", (int)(i*100/p_sys->i_pcrs_num) );
+        p_sys->b_force_seek_per_percent = true;
+    }
+
+    stream_Seek( p_demux->s, i_initial_pos );
+    p_sys->i_current_pcr = i_initial_pcr;
+}
+
+static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, block_t *p_bk )
+{
+    demux_sys_t   *p_sys = p_demux->p_sys;
+
+    if( p_sys->i_pmt_es <= 0 )
+        return;
+
+    mtime_t i_pcr = GetPCR( p_bk );
+    if( i_pcr >= 0 )
+    {
+        if( p_sys->i_pid_ref_pcr == pid->i_pid )
+        {
+            p_sys->i_current_pcr = AdjustPCRWrapAround( p_demux, i_pcr );
+        }
 
         /* Search program and set the PCR */
         for( int i = 0; i < p_sys->i_pmt; i++ )
@@ -1897,6 +2084,7 @@ static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, block_t *p_bk )
             {
                 if( pid->i_pid == p_sys->pmt[i]->psi->prg[i_prg]->i_pid_pcr )
                 {
+                    p_sys->pmt[i]->psi->prg[i_prg]->i_pcr_value = i_pcr;
                     es_out_Control( p_demux->out, ES_OUT_SET_GROUP_PCR,
                                     (int)p_sys->pmt[i]->psi->prg[i_prg]->i_number,
                                     (int64_t)(VLC_TS_0 + i_pcr * 100 / 9) );
@@ -2619,7 +2807,8 @@ static void ValidateDVBMeta( demux_t *p_demux, int i_pid )
 
 #ifdef TS_USE_DVB_SI
 /* FIXME same than dvbsi_to_utf8 from dvb access */
-static char *EITConvertToUTF8( const unsigned char *psz_instring,
+static char *EITConvertToUTF8( demux_t *p_demux,
+                               const unsigned char *psz_instring,
                                size_t i_length,
                                bool b_broken )
 {
@@ -2628,6 +2817,26 @@ static char *EITConvertToUTF8( const unsigned char *psz_instring,
     char psz_encbuf[sizeof( "ISO_8859-123" )];
     size_t i_in, i_out, offset = 1;
     vlc_iconv_t iconv_handle;
+    if( p_demux->p_sys->b_support_arib )
+    {
+        char *psz_outstring;
+        size_t i_out;
+    	arib_decoder_t decoder;
+
+        i_out = i_length * 3;
+        psz_outstring = malloc( i_out + 1 );
+        if( !psz_outstring )
+            return NULL;
+	arib_initialize_decoder( &decoder, false );
+        i_out = arib_decode_buffer( &decoder,
+                                    psz_instring,
+                                    i_length,
+                                    psz_outstring,
+                                    i_out );
+	arib_finalize_decoder( &decoder );
+        psz_outstring[i_out] = 0;
+        return psz_outstring;
+    }
 
     if( i_length < 1 ) return NULL;
     if( psz_instring[0] >= 0x20 )
@@ -2852,10 +3061,14 @@ static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
 
                 /* FIXME: Digital+ ES also uses ISO8859-1 */
 
-                str1 = EITConvertToUTF8(pD->i_service_provider_name,
+                str1 = EITConvertToUTF8(
+                                        p_demux,
+                                        pD->i_service_provider_name,
                                         pD->i_service_provider_name_length,
                                         p_sys->b_broken_charset );
-                str2 = EITConvertToUTF8(pD->i_service_name,
+                str2 = EITConvertToUTF8(
+                                        p_demux,
+                                        pD->i_service_name,
                                         pD->i_service_name_length,
                                         p_sys->b_broken_charset );
 
@@ -3018,9 +3231,13 @@ static void EITCallBack( demux_t *p_demux,
                    for epg atm*/
                 if( pE && psz_name == NULL)
                 {
-                    psz_name = EITConvertToUTF8( pE->i_event_name, pE->i_event_name_length,
+                    psz_name = EITConvertToUTF8( 
+                                                 p_demux,
+                                                 pE->i_event_name, pE->i_event_name_length,
                                                  p_sys->b_broken_charset );
-                    psz_text = EITConvertToUTF8( pE->i_text, pE->i_text_length,
+                    psz_text = EITConvertToUTF8( 
+                                                 p_demux,
+                                                 pE->i_text, pE->i_text_length,
                                                  p_sys->b_broken_charset );
                     msg_Dbg( p_demux, "    - short event lang=%3.3s '%s' : '%s'",
                              pE->i_iso_639_code, psz_name, psz_text );
@@ -3037,7 +3254,9 @@ static void EITCallBack( demux_t *p_demux,
 
                     if( pE->i_text_length > 0 )
                     {
-                        char *psz_text = EITConvertToUTF8( pE->i_text, pE->i_text_length,
+                        char *psz_text = EITConvertToUTF8( 
+                                                           p_demux,
+                                                           pE->i_text, pE->i_text_length,
                                                            p_sys->b_broken_charset );
                         if( psz_text )
                         {
@@ -3052,10 +3271,14 @@ static void EITCallBack( demux_t *p_demux,
 
                     for( int i = 0; i < pE->i_entry_count; i++ )
                     {
-                        char *psz_dsc = EITConvertToUTF8( pE->i_item_description[i],
+                        char *psz_dsc = EITConvertToUTF8( 
+                                                          p_demux,
+                                                          pE->i_item_description[i],
                                                           pE->i_item_description_length[i],
                                                           p_sys->b_broken_charset );
-                        char *psz_itm = EITConvertToUTF8( pE->i_item[i], pE->i_item_length[i],
+                        char *psz_itm = EITConvertToUTF8( 
+                                                          p_demux,
+                                                          pE->i_item[i], pE->i_item_length[i],
                                                           p_sys->b_broken_charset );
 
                         if( psz_dsc && psz_itm )
@@ -3195,6 +3418,19 @@ static bool PMTEsHasRegistration( demux_t *p_demux,
 
     assert( strlen(psz_tag) == 4 );
     return !memcmp( p_dr->p_data, psz_tag, 4 );
+}
+static bool PMTEsHasComponentTag( demux_t *p_demux,
+                                  const dvbpsi_pmt_es_t *p_es,
+                                  int i_component_tag )
+{
+    dvbpsi_descriptor_t *p_dr = PMTEsFindDescriptor( p_es, 0x52 );
+    if( !p_dr )
+        return false;
+    dvbpsi_stream_identifier_dr_t *p_si = dvbpsi_DecodeStreamIdentifierDr( p_dr );
+    if( !p_si )
+        return false;
+
+    return p_si->i_component_tag == i_component_tag;
 }
 static void PMTSetupEsISO14496( demux_t *p_demux, ts_pid_t *pid,
                                 const ts_prg_psi_t *prg, const dvbpsi_pmt_es_t *p_es )
@@ -3602,6 +3838,24 @@ static void PMTSetupEs0x06( demux_t *p_demux, ts_pid_t *pid,
         p_fmt->i_cat = AUDIO_ES;
         p_fmt->b_packetized = true;
         p_fmt->i_codec = VLC_CODEC_302M;
+    }
+    else if( PMTEsHasComponentTag( p_demux, p_es, 0x30 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x31 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x32 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x33 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x34 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x35 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x36 ) ||
+             PMTEsHasComponentTag( p_demux, p_es, 0x37 ) )
+    {
+        demux_sys_t *p_sys = p_demux->p_sys;
+        if( p_sys->b_support_arib )
+        {
+            es_format_t *p_fmt = &pid->es->fmt;
+            es_format_Init( p_fmt, SPU_ES, VLC_CODEC_ARIB );
+            p_fmt->psz_language = strndup ( "jpn", 3 );
+            p_fmt->psz_description = strdup( _("ARIB subtitles") );
+        }
     }
     else
     {

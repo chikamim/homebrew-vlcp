@@ -63,6 +63,7 @@
 #include <freetype/ftsynth.h>
 #include FT_FREETYPE_H
 #include FT_GLYPH_H
+#include <freetype/ftoutln.h>
 #define FT_FLOOR(X)     ((X & -64) >> 6)
 #define FT_CEIL(X)      (((X + 63) & -64) >> 6)
 #ifndef FT_MulFix
@@ -81,6 +82,9 @@
 # include <shlobj.h>
 # define HAVE_STYLES
 # undef HAVE_FONTCONFIG
+/* XXX Bad Static */
+static filter_t *badfilter;
+static int      badindex;
 #endif
 
 /* FontConfig */
@@ -253,6 +257,7 @@ struct line_desc_t
     int             i_width;
     int             i_red, i_green, i_blue;
     int             i_alpha;
+    int             i_ascender;
 
     line_desc_t    *p_next;
 };
@@ -357,6 +362,7 @@ static int Create( vlc_object_t *p_this )
         wcscat( wdir, L"\\fonts" );
     }
     p_sys->psz_win_fonts_path = FromWide( wdir );
+
 #endif
 
     /* Set default psz_fontfamily */
@@ -387,7 +393,6 @@ static int Create( vlc_object_t *p_this )
                                  p_sys->i_default_font_size, &fontindex );
 
 #endif
-    msg_Dbg( p_filter, "Using %s as font from file %s", psz_fontfamily, psz_fontfile );
     p_sys->psz_fontfamily = strdup( psz_fontfamily );
 
 #else /* !HAVE_STYLES */
@@ -618,7 +623,7 @@ static int Render( filter_t *p_filter, subpicture_region_t *p_region,
 
     for( ; p_line != NULL; p_line = p_line->p_next )
     {
-        int i_glyph_tmax = 0;
+        int i_glyph_tmax = p_line->i_ascender;
         int i_bitmap_offset, i_offset, i_align_offset = 0;
         for( i = 0; p_line->pp_glyphs[i] != NULL; i++ )
         {
@@ -647,7 +652,7 @@ static int Render( filter_t *p_filter, subpicture_region_t *p_region,
                 i_pitch + p_line->p_glyph_pos[ i ].x + p_glyph->left + 2 +
                 i_align_offset;
 
-            for( y = 0, i_bitmap_offset = 0; y < p_glyph->bitmap.rows; y++ )
+            for( y =  0 , i_bitmap_offset = 0; y < p_glyph->bitmap.rows; y++ )
             {
                 for( x = 0; x < p_glyph->bitmap.width; x++, i_bitmap_offset++ )
                 {
@@ -767,7 +772,7 @@ static void DrawBlack( line_desc_t *p_line, int i_width, subpicture_region_t *p_
 
     for( ; p_line != NULL; p_line = p_line->p_next )
     {
-        int i_glyph_tmax=0, i = 0;
+        int i_glyph_tmax=p_line->i_ascender, i = 0;
         int i_bitmap_offset, i_offset, i_align_offset = 0;
         for( i = 0; p_line->pp_glyphs[i] != NULL; i++ )
         {
@@ -872,6 +877,7 @@ static int RenderYUVA( filter_t *p_filter, subpicture_region_t *p_region,
         memset( p_dst_v, 0x80, i_pitch * p_region->fmt.i_height );
         memset( p_dst_a, 0x80, i_pitch * p_region->fmt.i_height );
     }
+
     if( p_filter->p_sys->i_effect == EFFECT_OUTLINE ||
         p_filter->p_sys->i_effect == EFFECT_OUTLINE_FAT )
     {
@@ -907,7 +913,7 @@ static int RenderYUVA( filter_t *p_filter, subpicture_region_t *p_region,
 
     for( ; p_line != NULL; p_line = p_line->p_next )
     {
-        int i_glyph_tmax = 0;
+        int i_glyph_tmax = p_line->i_ascender;
         int i_bitmap_offset, i_offset, i_align_offset = 0;
         for( i = 0; p_line->pp_glyphs[i] != NULL; i++ )
         {
@@ -1017,6 +1023,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
     int i_font_color, i_font_alpha, i_font_size, i_red, i_green, i_blue;
     vlc_value_t val;
     int i_scale = 1000;
+    bool b_halfsize;
 
     FT_BBox line;
     FT_BBox glyph_size;
@@ -1026,6 +1033,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
     /* Sanity check */
     if( !p_region_in || !p_region_out ) return VLC_EGENERIC;
     psz_string = p_region_in->psz_text;
+
     if( !psz_string || !*psz_string ) return VLC_EGENERIC;
 
     if( VLC_SUCCESS == var_Get( p_filter, "scale", &val ))
@@ -1036,16 +1044,19 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
         i_font_color = __MAX( __MIN( p_region_in->p_style->i_font_color, 0xFFFFFF ), 0 );
         i_font_alpha = __MAX( __MIN( p_region_in->p_style->i_font_alpha, 255 ), 0 );
         i_font_size  = __MAX( __MIN( p_region_in->p_style->i_font_size, 255 ), 0 ) * i_scale / 1000;
+	b_halfsize = (p_region_in->p_style->i_style_flags & STYLE_HALFWIDTH);
     }
     else
     {
         i_font_color = p_sys->i_font_color;
         i_font_alpha = 255 - p_sys->i_font_opacity;
         i_font_size  = p_sys->i_default_font_size * i_scale / 1000;
+	b_halfsize = false;
     }
 
     if( i_font_color == 0xFFFFFF ) i_font_color = p_sys->i_font_color;
     if( !i_font_alpha ) i_font_alpha = 255 - p_sys->i_font_opacity;
+
     SetFontSize( p_filter, i_font_size );
 
     i_red   = ( i_font_color & 0x00FF0000 ) >> 16;
@@ -1054,6 +1065,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
 
     result.x =  result.y = 0;
     line.xMin = line.xMax = line.yMin = line.yMax = 0;
+	    line.yMin = 999;
 
     psz_unicode = psz_unicode_orig =
         malloc( ( strlen(psz_string) + 1 ) * sizeof(uint32_t) );
@@ -1151,6 +1163,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
 #define face p_sys->p_face
 #define glyph face->glyph
 
+
     while( *psz_unicode )
     {
         i_char = *psz_unicode++;
@@ -1179,6 +1192,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
             i_pen_x = 0;
             i_previous = i = 0;
             line.xMin = line.xMax = line.yMin = line.yMax = 0;
+	    line.yMin = 999;
             i_pen_y += face->size->metrics.height >> 6;
 #if 0
             msg_Dbg( p_filter, "Creating new line, i is %d", i );
@@ -1196,6 +1210,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
             i_pen_x += delta.x >> 6;
 
         }
+
         p_line->p_glyph_pos[ i ].x = i_pen_x;
         p_line->p_glyph_pos[ i ].y = i_pen_y;
         i_error = FT_Load_Glyph( face, i_glyph_index, FT_LOAD_NO_BITMAP | FT_LOAD_DEFAULT );
@@ -1216,6 +1231,14 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
                                "%d", i_error );
             goto error;
         }
+	if (b_halfsize) {
+    FT_Matrix scale = { 1<<15, 0, 0,
+                        1<<16 };
+    FT_Outline *outl = &((FT_OutlineGlyph) tmp_glyph)->outline;
+    FT_Outline_Transform(outl, &scale);
+    FT_Outline_Translate(outl, 0, 0);
+    glyph->advance.x *= 0.5;
+	} 
         FT_Glyph_Get_CBox( tmp_glyph, ft_glyph_bbox_pixels, &glyph_size );
         i_error = FT_Glyph_To_Bitmap( &tmp_glyph, ft_render_mode_normal, 0, 1);
         if( i_error )
@@ -1265,6 +1288,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
             i_pen_x = 0;
             i_previous = i = 0;
             line.xMin = line.xMax = line.yMin = line.yMax = 0;
+	    line.yMin = 999;
             continue;
         }
         line.yMax = __MAX( line.yMax, glyph_size.yMax );
@@ -1284,6 +1308,15 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
     p_line->i_blue = i_blue;
     result.x = __MAX( result.x, line.xMax );
     result.y += line.yMax - line.yMin;
+    p_line->i_ascender = 0;
+
+    if (i_font_size > 0) { /* XXX baseline */
+	double ratio = (double)face->size->metrics.y_ppem / (double)face->units_per_EM;
+	p_line->i_ascender = face->ascender * ratio + 1;
+
+	if (result.y < p_line->i_ascender)
+	    result.y = p_line->i_ascender;
+    }
 
 #undef face
 #undef glyph
@@ -1295,6 +1328,7 @@ static int RenderText( filter_t *p_filter, subpicture_region_t *p_region_out,
         Render( p_filter, p_region_out, p_lines, result.x, result.y );
     else
         RenderYUVA( p_filter, p_region_out, p_lines, result.x, result.y );
+
 
     free( psz_unicode_orig );
     FreeLines( p_lines );
@@ -1450,6 +1484,7 @@ static int RenderTag( filter_t *p_filter, FT_Face p_face, int i_font_color,
     uint32_t *psz_unicode_start = psz_unicode;
 
     line.xMin = line.xMax = line.yMin = line.yMax = 0;
+	    line.yMin = 999;
 
     /* Account for part of line already in position */
     for( i = 0; i<*pi_start; i++ )
@@ -2306,9 +2341,21 @@ static int RenderHtml( filter_t *p_filter, subpicture_region_t *p_region_out,
 
 static int GetFileFontByName( const char *font_name, char **psz_filename )
 {
+extern wchar_t *vlcfnameconv(wchar_t *);
     HKEY hKey;
     wchar_t vbuffer[MAX_PATH];
     wchar_t dbuffer[256];
+    char *font_name_temp;
+    char *font_name_1033;
+    char *psz_value;
+    int subindex,i;
+
+    MultiByteToWideChar(CP_ACP,0,font_name,-1,dbuffer,256);
+    font_name_temp = FromWide(dbuffer);
+
+    font_name_1033 = FromWide( vlcfnameconv(dbuffer));
+
+    msg_Dbg( badfilter, "Search [%s] or [%s] from Registory", font_name_temp, font_name_1033 );
 
     if( RegOpenKeyEx(HKEY_LOCAL_MACHINE, FONT_DIR_NT, 0, KEY_READ, &hKey) != ERROR_SUCCESS )
         return 1;
@@ -2322,23 +2369,62 @@ static int GetFileFontByName( const char *font_name, char **psz_filename )
                            NULL, NULL, (LPBYTE)dbuffer, &dbuflen) != ERROR_SUCCESS )
             return 2;
 
-        char *psz_value = FromWide( vbuffer );
+        psz_value = FromWide( vbuffer );
 
         char *s = strchr( psz_value,'(' );
         if( s != NULL && s != psz_value ) s[-1] = '\0';
 
+ //  msg_Dbg( badfilter, "Check [%s] ", psz_value );
+
         /* Manage concatenated font names */
         if( strchr( psz_value, '&') ) {
-            if( strcasestr( psz_value, font_name ) != NULL )
-                break;
+/*
+  check each font name (for return face index)
+*/
+s = psz_value;
+subindex=1;
+while(1) {
+  s = strchr(s,'&');
+  if (s == NULL) break;
+  subindex++;
+  *s=0;
+  s = s + 1;
+}
+s = psz_value;
+for(i=0;i<subindex;i++) {
+   if (strcasestr(s,font_name_temp) != NULL) {
+     break;
+   }
+   if (strcasestr(s,font_name_1033) != NULL) {
+     break;
+   }
+   s = s + strlen(s)+1;
+}
+if (subindex!=i) {
+   badindex = i;
+   msg_Dbg( badfilter, "Match [%s] index %d ", s,badindex );
+   free(psz_value);
+   break;
+}
+
         }
         else {
-            if( strcasecmp( psz_value, font_name ) == 0 )
+            if( strcasecmp( psz_value, font_name_temp ) == 0 ) {
+   msg_Dbg( badfilter, "break1 [%s] ", font_name_temp );
+    		free(psz_value);
                 break;
+	    }
+            if( strcasecmp( psz_value, font_name_1033 ) == 0 ) {
+   msg_Dbg( badfilter, "break2 [%s] ", font_name_1033 );
+    		free(psz_value);
+                break;
+            }
         }
     }
 
     *psz_filename = FromWide( dbuffer );
+    free(font_name_temp);
+    free(font_name_1033);
     return 0;
 }
 
@@ -2357,7 +2443,7 @@ static char* Win32_Select( filter_t *p_filter, const char* family,
                            bool b_bold, bool b_italic, int i_size, int *i_idx )
 {
     VLC_UNUSED( i_size );
-    // msg_Dbg( p_filter, "Here in Win32_Select, asking for %s", family );
+    msg_Dbg( p_filter, "Here in Win32_Select, asking for %s", family );
 
     /* */
     LOGFONT lf;
@@ -2366,19 +2452,32 @@ static char* Win32_Select( filter_t *p_filter, const char* family,
         lf.lfItalic = true;
     if( b_bold )
         lf.lfWeight = FW_BOLD;
-    strncpy( (LPSTR)&lf.lfFaceName, family, 32);
+    //strncpy( (LPSTR)&lf.lfFaceName, family, 32);
+
+    char acp[32];
+    wchar_t wide[64];
+    MultiByteToWideChar(CP_UTF8,0,family,-1,wide,64);
+    WideCharToMultiByte(CP_ACP,0,wide,-1,acp,32," ",0);
+    strncpy( (LPSTR)&lf.lfFaceName, acp, 32);
+
+    badfilter = p_filter;
+    badindex = 0;
+
 
     /* */
     char *psz_filename = NULL;
     HDC hDC = GetDC( NULL );
     EnumFontFamiliesEx(hDC, &lf, (FONTENUMPROC)&EnumFontCallback, (LPARAM)&psz_filename, 0);
+
+    if( psz_filename == NULL ) {
+        msg_Dbg( p_filter, "no matching font %s. fallback to use meiryo.ttc", family );
+	psz_filename = "meiryo.ttc";
+    }
+
     ReleaseDC(NULL, hDC);
 
-    if( psz_filename == NULL )
-        return NULL;
-
     /* FIXME: increase i_idx, when concatenated strings  */
-    i_idx = 0;
+    *i_idx = badindex;
 
     /* */
     char *psz_tmp;
@@ -2561,6 +2660,7 @@ static line_desc_t *NewLine( int i_count )
     line_desc_t *p_line = malloc( sizeof(line_desc_t) );
 
     if( !p_line ) return NULL;
+    p_line->i_ascender = 0;
     p_line->i_height = 0;
     p_line->i_width = 0;
     p_line->p_next = NULL;

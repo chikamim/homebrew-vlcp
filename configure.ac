@@ -3192,6 +3192,16 @@ AS_IF( [test "${enable_telx}" != "no" ],[
   VLC_ADD_PLUGIN([telx])
   ])
 
+dnl 
+dnl ariibsub subtitle rendering module
+dnl
+AC_ARG_ENABLE(aribsub,
+  [  --enable-aribsub        ARIB Subtitle support (default enabled)])
+AS_IF( [test "${enable_aribsub}" != "no" ],[
+  VLC_ADD_PLUGIN([aribsub])
+  VLC_ADD_LIBS([aribsub],[-lpng -lz])
+  ])
+
 dnl
 dnl libass subtitle rendering module
 dnl
@@ -3446,7 +3456,7 @@ then
       have_freetype=yes
       VLC_ADD_CPPFLAGS([freetype skins2],[${FREETYPE_CFLAGS}])
       if test "${SYS}" = "mingw32"; then
-        VLC_ADD_LIBS([freetype],[-liconv -lz -lgdi32])
+        VLC_ADD_LIBS([freetype],[-liconv -lz -lgdi32 -lgdiplus])
       fi
       VLC_ADD_LIBS([freetype skins2],[${FREETYPE_LIBS}])
       if test "${enable_fontconfig}" != "no"

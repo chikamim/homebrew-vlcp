@@ -474,7 +474,10 @@ static int ReadMeta( vlc_object_t* p_this)
 
 #define SET( tag, meta )                                                       \
     if( !p_tag->tag().isNull() && !p_tag->tag().isEmpty() )                    \
-        vlc_meta_Set##meta( p_meta, p_tag->tag().toCString(true) )
+      if( p_tag->tag().isLatin1() )                                            \
+          vlc_meta_Set##meta( p_meta, FromLocale(p_tag->tag().toCString()) );  \
+      else                                                                     \
+          vlc_meta_Set##meta( p_meta, p_tag->tag().toCString(true) )
 #define SETINT( tag, meta )                                                    \
     if( p_tag->tag() )                                                         \
     {                                                                          \

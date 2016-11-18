@@ -332,6 +332,7 @@ static int Demux( demux_t *p_demux )
                     else continue;
                 }
                 psz_parse++;
+                psz_parse = SkipBlanks(psz_parse, (unsigned)-1);
                 if( !strncasecmp( psz_parse, "value", 5 ) )
                 {
                     if( ( psz_parse = strcasestr( psz_parse, "\"" ) ) )

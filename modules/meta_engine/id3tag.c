@@ -306,7 +306,7 @@ static void ParseAPEvXTag( demux_meta_t *p_demux_meta, const uint8_t *p_data, in
     {
         const int i_size = GetDWLE( &p_data[0] );
         const uint32_t flags = GetDWLE( &p_data[4] );
-        char psz_name[256];
+        char psz_name[256],*psz_wk;;
         int n;
 
         strlcpy( psz_name, (char*)&p_data[8], sizeof(psz_name) );
@@ -324,6 +324,7 @@ static void ParseAPEvXTag( demux_meta_t *p_demux_meta, const uint8_t *p_data, in
         {
             /* FIXME list are separated by '\0' */
             char *psz_value = strndup( (char*)&p_data[0], i_size );
+
 
             EnsureUTF8( psz_name );
             EnsureUTF8( psz_value );
